@@ -1,0 +1,28 @@
+# R
+.Rhistory
+.Rapp.history
+.Rproj.user
+*.Rproj
+*.utf8.md
+.Renviron
+.Rprofile.local
+
+# Knitr / rmarkdown (regenerate by knitting Rmd/getSAG.Rmd)
+Rmd/cache/
+Rmd/figs/
+Rmd/*.html
+Rmd/*.pdf
+
+# Extracted data (regenerate; large)
+data/sag/*.RData
+data/sag/*.rds
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.swp
+*~

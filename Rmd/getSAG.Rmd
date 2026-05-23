@@ -1,0 +1,601 @@
+---
+title: "ICES SAG extraction report"
+subtitle: "Time series, reference points, and catch advice by stock and assessment year"
+author: "Laurence T. Kell"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 2
+    df_print: paged
+    code_folding: hide
+params:
+  yrFrom: 2016
+  yrTo: 2025
+  fetch_scenarios: false
+  api_retries: 5
+  api_wait_s: 20
+  connect_timeout_s: 60
+  request_timeout_s: 300
+  reuse_stock_list: true
+---
+
+```{r setup, include=FALSE}
+projectRoot=normalizePath("..", winslash="/", mustWork=TRUE)
+knitr::opts_knit$set(root.dir=projectRoot)
+
+knitr::opts_chunk$set(
+  echo=FALSE, warning=FALSE, message=FALSE,
+  fig.width=10, fig.height=6,
+  fig.path="figs/", cache=TRUE, cache.path="cache/",
+  include=FALSE)
+
+yrFrom          =params$yrFrom
+yrTo            =params$yrTo
+assessYrs       =seq(yrTo, yrFrom)
+purpose         ="Advice"
+statusFilter    ="Published"
+fetch_scenarios =isTRUE(params$fetch_scenarios)
+apiRetries      =as.integer(params$api_retries)
+apiWait         =as.numeric(params$api_wait_s)
+connectTimeout  =as.numeric(params$connect_timeout_s)
+requestTimeout  =as.numeric(params$request_timeout_s)
+reuseStockList  =isTRUE(params$reuse_stock_list)
+outDir          =file.path(projectRoot, "data/sag")
+
+dir.create(outDir, recursive=TRUE, showWarnings=FALSE)
+dir.create("figs", recursive=TRUE, showWarnings=FALSE)
+dir.create("cache", recursive=TRUE, showWarnings=FALSE)
+
+rdataFile=file.path(outDir, sprintf("sag_%d_%d.RData", yrFrom, yrTo))
+```
+
+Pulls **ICES Stock Assessment Graph (SAG)** and **Advice View** data for all published advice stocks, retaining separate snapshots for each **assessment year** (`r yrFrom`–`r yrTo`). Extraction runs silently; results appear in the sections below.
+
+| Series / object | Source |
+|-----------------|--------|
+| SSB, F, recruits, catch | `icesSAG::getSAG(..., data = "summary")` |
+| Reference points | `icesSAG::getSAG(..., data = "refpts")` |
+| Catch advice | `icesASD::getAdviceViewRecord()` |
+| Catch scenarios (optional) | `icesASD::getCatchScenariosTable()` if `fetch_scenarios: true` |
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(icesSAG)
+  library(icesASD)
+  library(plyr)
+  library(dplyr)
+  library(tidyr)})
+
+sag_messages(FALSE)
+
+if (requireNamespace("httr", quietly=TRUE)) {
+  httr::set_config(httr::config(
+    connecttimeout=connectTimeout,
+    timeout=requestTimeout))
+}
+```
+
+```{r helpers}
+withRetries<-function(expr, label="ICES API", n=apiRetries, wait=apiWait) {
+  lastErr=NULL
+  for (attempt in seq_len(n)) {
+    res=tryCatch(
+      expr,
+      error=function(e) {
+        lastErr<<-e
+        NULL})
+    if (!is.null(res)) return(res)
+    if (attempt < n) {
+      warning(label, ": attempt ", attempt, "/", n, " failed (",
+              conditionMessage(lastErr), "); retrying in ", wait, " s",
+              call.=FALSE)
+      Sys.sleep(wait)
+      wait=min(wait * 1.5, 120)
+    }
+  }
+  stop(label, " failed after ", n, " attempts: ", conditionMessage(lastErr), call.=FALSE)
+}
+
+getCol<-function(df, choices) {
+  nms=names(df)
+  idx=match(tolower(choices), tolower(nms))
+  idx=idx[!is.na(idx)]
+  if (length(idx) == 0) NA_character_ else nms[idx[1]]}
+
+c2n<-function(x) suppressWarnings(as.numeric(as.character(x)))
+
+#' Standardise one getSAG() summary table to long SSB / F / catch / recruits.
+tidySmry<-function(dat, sid, assYr) {
+  if (is.null(dat) || !is.data.frame(dat) || nrow(dat) == 0) {
+    return(NULL)}
+
+  yearCol    =getCol(dat, c("year"))
+  ssbCol     =getCol(dat, c("ssb", "stocksize", "tbiomass"))
+  fCol       =getCol(dat, c("f", "fbar", "fishingpressure"))
+  recruitsCol=getCol(dat, c("recruitment", "recruits"))
+  catchesCol =getCol(dat, c("catches"))
+  landingsCol=getCol(dat, c("landings"))
+  discardsCol=getCol(dat, c("discards"))
+
+  if (is.na(yearCol)) return(NULL)
+
+  out=data.frame(
+    sid            =sid,
+    assYr=assYr,
+    year           =c2n(dat[[yearCol]]),
+    SSB            =if (!is.na(ssbCol)) c2n(dat[[ssbCol]]) else NA_real_,
+    F              =if (!is.na(fCol)) c2n(dat[[fCol]]) else NA_real_,
+    recruits       =if (!is.na(recruitsCol)) c2n(dat[[recruitsCol]]) else NA_real_,
+    catches        =if (!is.na(catchesCol)) c2n(dat[[catchesCol]]) else NA_real_,
+    landings       =if (!is.na(landingsCol)) c2n(dat[[landingsCol]]) else NA_real_,
+    discards       =if (!is.na(discardsCol)) c2n(dat[[discardsCol]]) else NA_real_,
+    stringsAsFactors= FALSE)
+
+  out$catch=with(out, ifelse(
+    is.finite(catches), catches,
+    landings + ifelse(is.finite(discards), discards, 0)))
+
+  out=out[is.finite(out$year),
+          c("sid", "assYr", "year", "SSB", "F", "recruits", "catch")]
+  out[order(out$year), ]}
+
+sagFn<-function(sid, assYr, data="summary", purpose="Advice") {
+  tryCatch(
+    withRetries(
+      suppressMessages(getSAG(stock=sid, year=assYr, data=data, purpose=purpose)),
+      label=paste0("getSAG/", data, " (", sid, ", ", assYr, ")"),
+      n=max(2L, apiRetries)),
+    error=function(e) {
+      warning(conditionMessage(e), call.=FALSE)
+      NULL})}
+
+refptCols=c(
+  "FLim", "Fpa", "Bpa", "Blim", "FMSY", "BMSY", "MSYBtrigger", "MSYBescapement",
+  "Fmanagement", "Bmanagement", "TerminalYear", "FAge", "ModelType", "ModelName")
+
+tidyRefpts<-function(dat, sid, assYr) {
+  if (is.null(dat) || !is.data.frame(dat) || nrow(dat) == 0) return(NULL)
+  r=dat[nrow(dat), , drop=FALSE]
+  out=data.frame(
+    sid            =sid,
+    assYr=assYr,
+    stringsAsFactors=FALSE)
+  for (cn in refptCols) {
+    out[[cn]]=if (cn %in% names(r)) c2n(r[[cn]]) else NA_real_}
+  if ("StockKeyLabel" %in% names(r)) out$stock_key_label=as.character(r$StockKeyLabel)
+  out}
+
+adviceYear<-function(x) {
+  x=as.character(x)
+  d=suppressWarnings(as.Date(sub("T.*", "", x)))
+  if (all(is.na(d)) && any(grepl("/", x))) {
+    d=suppressWarnings(as.Date(x, format="%d/%m/%Y"))}
+  as.integer(format(d, "%Y"))}
+
+tidyAdvice<-function(adv, assYr) {
+  if (is.null(adv) || !is.data.frame(adv) || nrow(adv) == 0) return(NULL)
+  sidCol=getCol(adv, c("stockcode", "stockkeylabel"))
+  if (is.na(sidCol)) return(NULL)
+
+  out=data.frame(
+    sid            =as.character(adv[[sidCol]]),
+    assYr=assYr,
+    advice_key     =if ("adviceKey" %in% names(adv)) adv$adviceKey else NA_integer_,
+    advice_year    =adviceYear(adv$adviceApplicableFrom),
+    advice_until   =adviceYear(adv$adviceApplicableUntil),
+    advice         =if ("adviceValue" %in% names(adv)) c2n(adv$adviceValue) else NA_real_,
+    advice_unit    =if ("adviceValueUnit" %in% names(adv)) as.character(adv$adviceValueUnit) else NA_character_,
+    wanted_catch   =if ("wantedCatch" %in% names(adv)) c2n(adv$wantedCatch) else NA_real_,
+    advice_type    =if ("adviceType" %in% names(adv)) as.character(adv$adviceType) else NA_character_,
+    advice_category=if ("adviceCategory" %in% names(adv)) as.character(adv$adviceCategory) else NA_character_,
+    advice_sentence=if ("adviceSentence" %in% names(adv)) as.character(adv$adviceSentence) else NA_character_,
+    advice_doi     =if ("adviceDOI" %in% names(adv)) as.character(adv$adviceDOI) else NA_character_,
+    stringsAsFactors=FALSE)
+
+  out=out[!is.na(out$sid) & nzchar(out$sid), ]
+  out}
+
+tidyCatch<-function(dat, sid, assYr, advice_key) {
+  if (is.null(dat) || !is.data.frame(dat) || nrow(dat) == 0) return(NULL)
+  lbl=getCol(dat, c("ak_label"))
+  valCol=getCol(dat, c("value"))
+  yrCol=getCol(dat, c("yearlabel"))
+  purpCol=getCol(dat, c("cs_purpose", "cS_Purpose"))
+  if (is.na(valCol)) return(NULL)
+
+  out=data.frame(
+    sid            =sid,
+    assYr=assYr,
+    advice_key     =advice_key,
+    scenario_purpose=if (!is.na(purpCol)) as.character(dat[[purpCol]]) else NA_character_,
+    scenario_basis  =if ("cS_Basis" %in% names(dat)) as.character(dat$cS_Basis) else NA_character_,
+    variable       =if (!is.na(lbl)) as.character(dat[[lbl]]) else NA_character_,
+    advice_year    =if (!is.na(yrCol)) c2n(dat[[yrCol]]) else NA_real_,
+    value          =c2n(dat[[valCol]]),
+    unit           =if ("unit" %in% names(dat)) as.character(dat$unit) else NA_character_,
+    stringsAsFactors=FALSE)
+
+  out=out[!is.na(out$variable), ]
+  out}
+
+sagKable<-function(x, caption, align=NULL) {
+  if (is.null(align)) align=rep("l", ncol(x))
+  tab=knitr::kable(x, caption=caption, align=align, format="html", row.names=FALSE)
+  if (requireNamespace("kableExtra", quietly=TRUE)) {
+    kableExtra::kable_styling(
+      tab,
+      bootstrap_options=c("striped", "hover", "condensed"),
+      full_width=FALSE,
+      position="left")
+  } else tab
+}
+
+sagSummary<-function() {
+  nGrid=nrow(grid)
+  nStocks=length(unique(grid$sid))
+  nTsPairs=if (exists("sag_ts") && nrow(sag_ts) > 0) {
+    nrow(unique(sag_ts[, c("sid", "assYr"), drop=FALSE]))
+  } else 0L
+  nTsRows=if (exists("sag_ts")) nrow(sag_ts) else 0L
+  nRefpts=if (exists("sag_refpts")) nrow(sag_refpts) else 0L
+  nAdvice=if (exists("sag_advice")) nrow(sag_advice) else 0L
+  nAdviceVal=if (exists("sag_advice")) sum(is.finite(sag_advice$advice)) else 0L
+  nScenarios=if (exists("sag_scenarios") && nrow(sag_scenarios) > 0) {
+    nrow(sag_scenarios)
+  } else NA_integer_
+
+  pct=function(n, d) if (d > 0) sprintf("%.1f%%", 100 * n / d) else "—"
+
+  data.frame(
+    Metric=c(
+      "Assessment years",
+      "Stock–assessment pairs",
+      "Unique stocks",
+      "Time series (stock–assessments)",
+      "Time series rows",
+      "Reference points",
+      "Advice records",
+      "Advice values (non-missing)",
+      "Catch scenarios"),
+    Count=c(
+      length(assessYrs),
+      nGrid,
+      nStocks,
+      nTsPairs,
+      nTsRows,
+      nRefpts,
+      nAdvice,
+      nAdviceVal,
+      if (is.na(nScenarios)) NA_integer_ else nScenarios),
+    Coverage=c(
+      paste(min(assessYrs), "–", max(assessYrs), sep=""),
+      pct(nTsPairs, nGrid),
+      "—",
+      paste0(format(nTsPairs, big.mark=","), " / ", format(nGrid, big.mark=",")),
+      "—",
+      pct(nRefpts, nGrid),
+      pct(nAdvice, nGrid),
+      pct(nAdviceVal, nAdvice),
+      if (is.na(nScenarios)) "not fetched" else "fetched"),
+    stringsAsFactors=FALSE)
+  out$Count=ifelse(is.na(out$Count), "—", format(out$Count, big.mark=",", scientific=FALSE))
+  out
+}
+
+sagObjects<-function() {
+  data.frame(
+    Object=c(
+      "sag_ts", "sag_refpts", "sag_advice", "sag_stock", "sag_scenarios",
+      "stockIndex", "grid", "rawList", "yrFrom", "yrTo"),
+    Description=c(
+      "Long time series: SSB, F, recruits, catch by calendar year",
+      "Reference points (Blim, FMSY, MSYBtrigger, …) per stock × assessment year",
+      "Catch advice and metadata from Advice View",
+      "One row per stock × assessment year: refpts + primary advice",
+      "Catch scenario tables (empty if scenarios not fetched)",
+      "Stock list metadata from getListStocks()",
+      "Stock × assessment year query grid",
+      "Raw SAG summary tables (all columns)",
+      "First assessment year in extract",
+      "Last assessment year in extract"),
+    stringsAsFactors=FALSE)
+}
+```
+
+```{r stock-list}
+loadStockListFromRdata<-function() {
+  if (!reuseStockList || !file.exists(rdataFile)) return(NULL)
+  env=new.env()
+  load(rdataFile, envir=env)
+  if (!all(c("grid", "stockIndex") %in% ls(env))) return(NULL)
+  stockIndex=get("stockIndex", env)
+  list(
+    grid=get("grid", env),
+    stockIndex=stockIndex,
+    stockLists=split(stockIndex, stockIndex$assYr))
+}
+
+fetchStockList<-function() {
+  stockLists=lapply(assessYrs, function(yr) {
+    sl=withRetries(
+      suppressMessages(getListStocks(year=yr)),
+      label=paste0("getListStocks(", yr, ")"))
+    if (!is.null(statusFilter) && nzchar(statusFilter) && "Status" %in% names(sl)) {
+      sl=subset(sl, Status == statusFilter)
+    }
+    sl$assYr=yr
+    sl})
+  names(stockLists)=assessYrs
+
+  stockIndex=do.call(rbind, lapply(stockLists, function(x) {
+    cols=c("StockKeyLabel", "StockDescription", "SpeciesName", "AssessmentYear",
+           "assYr", "AssessmentKey", "Status", "LinkToAdvice")
+    x[, cols[cols %in% names(x)], drop=FALSE]}))
+  names(stockIndex)[1]="sid"
+
+  grid=unique(stockIndex[, c("sid", "assYr")])
+  grid=grid[order(grid$assYr, grid$sid), ]
+  list(grid=grid, stockIndex=stockIndex, stockLists=stockLists)
+}
+
+stockData=tryCatch(
+  fetchStockList(),
+  error=function(e) {
+    cached=loadStockListFromRdata()
+    if (!is.null(cached)) {
+      warning(
+        "Could not reach ICES SAG API; reusing stock list from:\n  ", rdataFile,
+        "\nOriginal error: ", conditionMessage(e),
+        call.=FALSE)
+      cached
+    } else {
+      stop(
+        "Could not reach ICES SAG API and no saved stock list to fall back on.\n",
+        "  Expected: ", rdataFile, "\n",
+        "Check network/VPN, increase timeouts (connect_timeout_s, request_timeout_s), ",
+        "or run again when sag.ices.dk is reachable.\n",
+        "Original error: ", conditionMessage(e),
+        call.=FALSE)
+    }
+  })
+
+grid=stockData$grid
+stockIndex=stockData$stockIndex
+stockLists=stockData$stockLists
+```
+
+```{r extract}
+# Loop over stock × assessment year (avoids mdply empty bind when all calls fail).
+sagParts=vector("list", nrow(grid))
+rawParts=vector("list", nrow(grid))
+
+for (i in seq_len(nrow(grid))) {
+  sid=grid$sid[i]
+  ay =grid$assYr[i]
+  raw=sagFn(sid, ay)
+  if (is.null(raw) || !is.data.frame(raw) || nrow(raw) == 0) next
+
+  if ("Year" %in% names(raw)) names(raw)[names(raw) == "Year"]="year"
+  rawParts[[i]]=data.frame(sid=sid, assYr=ay, raw, check.names=FALSE)
+  sagParts[[i]]=tidySmry(raw, sid, ay)}
+
+rawParts=rawParts[!vapply(rawParts, is.null, logical(1))]
+sagParts=sagParts[!vapply(sagParts, is.null, logical(1))]
+
+rawList=if (length(rawParts)) do.call(rbind, rawParts) else data.frame()
+
+if (length(sagParts) == 0) {
+  sag_ts=data.frame(
+    sid=character(), assYr=integer(), year=integer(),
+    SSB=double(), F=double(), recruits=double(), catch=double(),
+    stringsAsFactors=FALSE
+  )
+  warning("No SAG data retrieved — check network/API access and stock list.")
+} else {
+  sag_ts=do.call(rbind, sagParts)
+  sag_ts=sag_ts[order(sag_ts$sid, sag_ts$assYr, sag_ts$year), ]
+  rownames(sag_ts)=NULL
+}
+```
+
+```{r extract-refpts}
+refptParts=vector("list", nrow(grid))
+
+for (i in seq_len(nrow(grid))) {
+  sid=grid$sid[i]
+  ay =grid$assYr[i]
+  raw=sagFn(sid, ay, data="refpts")
+  refptParts[[i]]=tidyRefpts(raw, sid, ay)}
+
+refptParts=refptParts[!vapply(refptParts, is.null, logical(1))]
+
+if (length(refptParts) == 0) {
+  sag_refpts=data.frame(sid=character(), assYr=integer())
+} else {
+  sag_refpts=do.call(rbind, refptParts)
+  rownames(sag_refpts)=NULL
+}
+
+# Link to advice sheet from stock index where available
+if ("LinkToAdvice" %in% names(stockIndex)) {
+  links=unique(stockIndex[, c("sid", "assYr", "LinkToAdvice")])
+  sag_refpts=merge(sag_refpts, links, by=c("sid", "assYr"), all.x=TRUE)
+}
+```
+
+```{r extract-advice}
+adviceParts=lapply(assessYrs, function(ay) {
+  adv=tryCatch(
+    withRetries(
+      suppressMessages(getAdviceViewRecord(year=ay)),
+      label=paste0("getAdviceViewRecord(", ay, ")")),
+    error=function(e) {
+      warning("getAdviceViewRecord failed (", ay, "): ", conditionMessage(e),
+              call.=FALSE)
+      NULL})
+  if (is.null(adv)) return(NULL)
+  adv=tidyAdvice(adv, ay)
+  if (is.null(adv)) return(NULL)
+  adv[adv$sid %in% grid$sid[grid$assYr == ay], , drop=FALSE]})
+
+adviceParts=adviceParts[!vapply(adviceParts, is.null, logical(1))]
+
+if (length(adviceParts) == 0) {
+  sag_advice=data.frame(
+    sid=character(), assYr=integer(), advice_year=integer(),
+    advice=double(), stringsAsFactors=FALSE)
+} else {
+  sag_advice=do.call(rbind, adviceParts)
+  rownames(sag_advice)=NULL
+  sag_advice=sag_advice[order(sag_advice$sid, sag_advice$assYr, sag_advice$advice_year), ]
+}
+```
+
+```{r extract-advice-scenarios, eval=fetch_scenarios}
+scenarioParts=vector("list", nrow(sag_advice))
+
+for (i in seq_len(nrow(sag_advice))) {
+  key=sag_advice$advice_key[i]
+  if (!is.finite(key)) next
+  sid=sag_advice$sid[i]
+  ay =sag_advice$assYr[i]
+  cs=tryCatch(
+    withRetries(
+      suppressMessages(getCatchScenariosTable(adviceKey=key)),
+      label=paste0("getCatchScenariosTable(", sid, ", key ", key, ")"),
+      n=max(2L, apiRetries)),
+    error=function(e) {
+      warning("getCatchScenariosTable failed (", sid, ", key ", key, "): ",
+              conditionMessage(e), call.=FALSE)
+      NULL})
+  scenarioParts[[i]]=tidyCatch(cs, sid, ay, key)}
+
+scenarioParts=scenarioParts[!vapply(scenarioParts, is.null, logical(1))]
+
+if (length(scenarioParts) == 0) {
+  sag_scenarios=data.frame()
+} else {
+  sag_scenarios=do.call(rbind, scenarioParts)
+  rownames(sag_scenarios)=NULL
+}
+```
+
+## Results
+
+```{r summary, include=TRUE, echo=FALSE, results="asis"}
+cat(sprintf(
+  "**Output file:** `%s`\n\n",
+  normalizePath(rdataFile, winslash="/", mustWork=FALSE)))
+print(sagKable(
+  sagSummary(),
+  caption=sprintf("Extraction summary (%d–%d)", yrFrom, yrTo),
+  align=c("l", "r", "r")))
+cat("\n\n")
+print(sagKable(
+  sagObjects(),
+  caption="Objects saved in the RData file",
+  align=c("l", "l", "l")))
+```
+
+```{r save}
+if (!exists("sag_refpts")) {
+  sag_refpts=data.frame(sid=character(), assYr=integer())
+}
+if (!exists("sag_advice")) {
+  sag_advice=data.frame(
+    sid=character(), assYr=integer(), advice_year=integer(),
+    advice=double(), stringsAsFactors=FALSE)
+}
+
+# Combined stock × assessment table (refpts + primary catch advice)
+advPrimary=sag_advice
+if (exists("sag_advice") && nrow(sag_advice) > 0 &&
+    any(duplicated(paste(sag_advice$sid, sag_advice$assYr)))) {
+  advPrimary=do.call(rbind, lapply(
+    split(sag_advice, paste(sag_advice$sid, sag_advice$assYr)),
+    function(x) {
+      x=x[order(x$advice_year), , drop=FALSE]
+      x[1, , drop=FALSE]
+    }))}
+
+advCols=c("sid", "assYr", "advice_year", "advice", "advice_unit",
+          "wanted_catch", "advice_type", "advice_sentence", "advice_key")
+advCols=advCols[advCols %in% names(advPrimary)]
+
+sag_stock=merge(unique(grid), sag_refpts, by=c("sid", "assYr"), all.x=TRUE)
+if (exists("advPrimary") && nrow(advPrimary) > 0 && length(advCols) > 2) {
+  sag_stock=merge(sag_stock, advPrimary[, advCols, drop=FALSE],
+                  by=c("sid", "assYr"), all.x=TRUE)
+}
+
+if (!exists("sag_scenarios")) {
+  sag_scenarios=data.frame()}
+
+save(
+  sag_ts, sag_refpts, sag_advice, sag_stock, sag_scenarios,
+  stockIndex, grid, rawList, yrFrom, yrTo,
+  file=rdataFile)
+```
+
+## Coverage by assessment year
+
+```{r preview, include=TRUE, echo=FALSE, results="asis"}
+coverage=ddply(grid, .(assYr), function(g) {
+  got=unique(sag_ts$sid[sag_ts$assYr == g$assYr[1]])
+  nReq=nrow(g)
+  nGot=length(intersect(g$sid, got))
+  data.frame(
+    assYr=g$assYr[1],
+    stocks_requested=nReq,
+    stocks_with_series=nGot,
+    missing=nReq - nGot,
+  pct_with_series=round(100 * nGot / nReq, 1),
+  stringsAsFactors=FALSE)
+})
+coverage=coverage[order(coverage$assYr, decreasing=TRUE), ]
+print(sagKable(
+  coverage,
+  caption="Stocks with at least one time-series row in SAG summary",
+  align=c("r", "r", "r", "r", "r")))
+```
+
+## Example time series
+
+Northeast Atlantic mackerel (`mac.27.nea`): each coloured line is the series as published in that assessment year.
+
+```{r example-plot, fig.height=7, fig.width=9, include=TRUE, eval=requireNamespace("ggplot2", quietly=TRUE)}
+if (requireNamespace("ggplot2", quietly=TRUE) && nrow(sag_ts) > 0) {
+  exSid=intersect("mac.27.nea", unique(sag_ts$sid))[1]
+  if (!is.na(exSid)) {
+    ex=subset(sag_ts, sid == exSid)
+    exLong=tidyr::pivot_longer(
+      ex,
+      cols=c("SSB", "F", "recruits", "catch"),
+      names_to="variable",
+      values_to="value")
+    varLabs=c(SSB="SSB", F="F", recruits="Recruits", catch="Catch")
+    exLong$variable=factor(exLong$variable, levels=names(varLabs), labels=varLabs)
+
+    ggplot2::ggplot(exLong, ggplot2::aes(year, value, colour=factor(assYr))) +
+      ggplot2::geom_line(linewidth=0.7, alpha=0.85) +
+      ggplot2::facet_wrap(~variable, scales="free_y", ncol=1) +
+      ggplot2::scale_colour_viridis_d(option="C", name="Assessment\nyear") +
+      ggplot2::labs(
+        title="Northeast Atlantic mackerel",
+        subtitle="SAG summary by assessment year",
+        x="Calendar year",
+        y=NULL) +
+      ggplot2::theme_minimal(base_size=11) +
+      ggplot2::theme(
+        legend.position="right",
+        panel.grid.minor=ggplot2::element_blank(),
+        strip.text=ggplot2::element_text(face="bold"))
+  }
+}
+```
