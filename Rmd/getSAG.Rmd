@@ -252,7 +252,7 @@ sagSummary<-function() {
 
   pct=function(n, d) if (d > 0) sprintf("%.1f%%", 100 * n / d) else "—"
 
-  data.frame(
+  out=data.frame(
     Metric=c(
       "Assessment years",
       "Stock–assessment pairs",
